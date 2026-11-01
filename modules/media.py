@@ -32,53 +32,91 @@ def get_headers():
     }
 
 
+def get_search_candidates(query):
+    raw_query = str(query or "").strip()
+    candidates = []
+    seen = set()
+
+    def add(candidate):
+        candidate = str(candidate).strip()
+        if not candidate:
+            return
+        key = candidate.lower()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+
+    add(raw_query)
+
+    simplified = re.sub(
+        r"\b(topographic|satellite|map|highlighting|showing|the|and|of|with|for)\b",
+        " ",
+        raw_query,
+        flags=re.IGNORECASE,
+    )
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    add(simplified)
+
+    for part in re.split(r"\s*(?:and|highlighting|showing|map)\s*", simplified, flags=re.IGNORECASE):
+        add(part)
+
+    if any(keyword in raw_query.lower() for keyword in ["mountain", "ridge", "alleg", "blue"]):
+        add("mountain landscape")
+        add("scenic mountain ridge")
+
+    add("landscape photography")
+    add("nature scenery")
+    add("mountain view")
+    return candidates
+
+
 def search_unsplash(query, orientation="landscape"):
     headers = get_headers()
 
-    print("Searching Unsplash for:", query)
+    for candidate in get_search_candidates(query):
+        print("Searching Unsplash for:", candidate)
 
-    for attempt in range(4):
-        try:
-            response = requests.get(
-                f"{UNSPLASH_API}/search/photos",
-                headers=headers,
-                params={
-                    "query": query,
-                    "page": 1,
-                    "per_page": 10,
-                    "orientation": orientation,
-                    "content_filter": "high"
-                },
-                timeout=40
-            )
-
-            if response.status_code == 429:
-                raise RuntimeError(
-                    "Unsplash rate limit reached. Try again later."
+        for attempt in range(4):
+            try:
+                response = requests.get(
+                    f"{UNSPLASH_API}/search/photos",
+                    headers=headers,
+                    params={
+                        "query": candidate,
+                        "page": 1,
+                        "per_page": 10,
+                        "orientation": orientation,
+                        "content_filter": "high"
+                    },
+                    timeout=40
                 )
 
-            response.raise_for_status()
+                if response.status_code == 429:
+                    raise RuntimeError(
+                        "Unsplash rate limit reached. Try again later."
+                    )
 
-            results = response.json().get("results", [])
+                response.raise_for_status()
 
-            if not results:
-                raise RuntimeError(
-                    f"No Unsplash photographs found for: {query}"
-                )
+                results = response.json().get("results", [])
 
-            return results
+                if results:
+                    return results
 
-        except requests.RequestException as error:
-            if attempt == 3:
-                raise RuntimeError(
-                    f"Unsplash search failed: {error}"
-                ) from error
+                break
 
-            delay = 3 * (attempt + 1)
-            print(f"Search retry in {delay} seconds.")
-            time.sleep(delay)
+            except requests.RequestException as error:
+                if attempt == 3:
+                    print(f"Unsplash search failed for '{candidate}': {error}")
+                    break
 
-    raise RuntimeError("Unsplash search failed.")
+                delay = 3 * (attempt + 1)
+                print(f"Search retry in {delay} seconds.")
+                time.sleep(delay)
+
+    raise RuntimeError(
+        f"No Unsplash photographs found for: {query}"
+    )
 
 
 def track_download(photo):
