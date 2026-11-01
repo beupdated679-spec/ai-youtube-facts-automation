@@ -35,7 +35,6 @@ def run_pipeline(config, root: Path):
 
     voice_path = work / "voice.mp3"
     generate_voice(data["narration"], voice_path, config.get("tts_voice", "en-US-AriaNeural"))
-
     seconds = int(config["short_seconds"] if fmt == "short" else config["long_seconds"])
     video_path = output / f"daily_{fmt}.mp4"
     first_video_source = create_video(
@@ -49,13 +48,11 @@ def run_pipeline(config, root: Path):
 )
 
 thumb_path = output / "thumbnail.jpg"
-
 create_thumbnail(
     data.get("thumbnail_text") or data["title"],
     thumb_path,
     first_video_source
 )
-
     result = upload_video(video_path, data, thumb_path, config)
     report = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
