@@ -1,0 +1,28 @@
+{
+  "channel_name": "USA Facts & Knowledge",
+  "target_audience": "United States",
+  "language": "American English",
+  "channel_category": "Facts & Knowledge",
+  "subtopics": [
+    "science facts",
+    "human body",
+    "space and astronomy",
+    "animals and nature",
+    "history and inventions",
+    "everyday science",
+    "geography and the natural world"
+  ],
+  "format_strategy": "alternate",
+  "short_seconds": 45,
+  "long_seconds": 180,
+  "short_scene_count": 6,
+  "long_scene_count": 12,
+  "publish_privacy": "public",
+  "made_for_kids": false,
+  "category_id": "27",
+  "default_language": "en-US",
+  "tts_voice": "en-US-AriaNeural",
+  "gemini_model": "gemini-3.8-flash",
+  "video_title_suffix": "",
+  "max_tags": 15
+}
