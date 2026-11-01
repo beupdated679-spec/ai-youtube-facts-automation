@@ -1,90 +1,153 @@
 import os
-import math
 import random
-import textwrap
-import requests
 import subprocess
-
+import requests
+import math
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-
 VIDEVO_API_URL = "https://api.videvo.net/v1/search"
-IMAGE_INTERVAL = 3
-VIDEO_FPS = 30
 
 
 def run(cmd):
     subprocess.run(cmd, check=True)
 
 
-def get_font(size, bold=True):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    ]
-
-    for font_path in candidates:
-        if os.path.exists(font_path):
-            return ImageFont.truetype(font_path, size=size)
-
-    return ImageFont.load_default()
-
-
 def extract_results(data):
-    """Accept common search-result response structures."""
+    """
+    Find video results in common Videvo API response formats.
+    """
     if isinstance(data, list):
         return data
 
     if not isinstance(data, dict):
         return []
 
-    for key in ("results", "data", "videos", "items"):
+    for key in ("results", "data", "clips", "videos", "items"):
         value = data.get(key)
 
         if isinstance(value, list):
             return value
 
         if isinstance(value, dict):
-            for nested in ("results", "videos", "items"):
-                if isinstance(value.get(nested), list):
-                    return value[nested]
+            for nested_key in ("results", "clips", "videos", "items"):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    return nested
 
     return []
 
 
-def fetch_videvo_clip(query, output_path, page=1):
+def find_download_url(clip):
+    """
+    Extract a possible video download URL from a result.
+    """
+    if not isinstance(clip, dict):
+        return None
+
+    direct_fields = (
+        "download_url",
+        "downloadUrl",
+        "url_hd",
+        "url_sd",
+        "video_url",
+        "preview_url",
+    )
+
+    for field in direct_fields:
+        value = clip.get(field)
+
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+
+    # Some APIs put download links inside nested objects.
+    for field in ("download", "files", "video_files", "video"):
+        value = clip.get(field)
+
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+
+        if isinstance(value, dict):
+            for nested_value in value.values():
+                if isinstance(nested_value, str) and nested_value.startswith("http"):
+                    return nested_value
+
+                if isinstance(nested_value, dict):
+                    for item in nested_value.values():
+                        if isinstance(item, str) and item.startswith("http"):
+                            return item
+
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.startswith("http"):
+                    return item
+
+                if isinstance(item, dict):
+                    for nested_value in item.values():
+                        if isinstance(nested_value, str) and nested_value.startswith("http"):
+                            return nested_value
+
+    return None
+
+
+def fetch_videvo_clip(query, output_path):
+    """
+    Search Videvo and download one real video clip.
+    """
     api_key = os.getenv("VIDEVO_API_KEY")
 
     if not api_key:
-        raise RuntimeError("Missing VIDEVO_API_KEY GitHub secret.")
+        raise RuntimeError("VIDEVO_API_KEY is missing from GitHub Secrets.")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
 
     params = {
         "query": query,
-        "page": page,
-        "per_page": 10,
-        "license_type": "free"
+        "page": 1,
+        "per_page": 20,
+        "license_type": "free",
     }
+
+    print(f"Searching Videvo for: {query}")
 
     response = requests.get(
         VIDEVO_API_URL,
         headers=headers,
         params=params,
-        timeout=45
+        timeout=40,
     )
+
+    print("Videvo search HTTP status:", response.status_code)
+
+    if response.status_code == 401:
+        raise RuntimeError("Videvo rejected the API key (HTTP 401).")
+
+    if response.status_code == 403:
+        raise RuntimeError("Videvo denied API access (HTTP 403).")
+
+    if response.status_code == 429:
+        raise RuntimeError("Videvo rate limit reached (HTTP 429).")
 
     response.raise_for_status()
 
-    results = extract_results(response.json())
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("Videvo did not return valid JSON.")
+
+    if isinstance(data, dict):
+        print("Videvo response keys:", list(data.keys()))
+
+    results = extract_results(data)
 
     if not results:
-        print(f"No Videvo results for: {query}")
-        return False
+        raise RuntimeError(
+            "Videvo returned no recognizable video results. "
+            "Check the API response format and API access."
+        )
 
     random.shuffle(results)
 
@@ -92,338 +155,264 @@ def fetch_videvo_clip(query, output_path, page=1):
         if not isinstance(clip, dict):
             continue
 
-        video_url = (
-            clip.get("download_url")
-            or clip.get("downloadUrl")
-            or clip.get("video_url")
-            or clip.get("url")
-        )
+        print("Available clip fields:", list(clip.keys()))
+
+        video_url = find_download_url(clip)
 
         if not video_url:
             continue
 
         try:
-            video = requests.get(
+            video_response = requests.get(
                 video_url,
                 timeout=90,
-                stream=True
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0"},
             )
 
-            video.raise_for_status()
+            print("Video download HTTP status:", video_response.status_code)
 
-            content_type = video.headers.get(
-                "Content-Type", ""
-            ).lower()
-
-            if "text/html" in content_type:
-                print("Skipping webpage instead of video.")
-                video.close()
-                continue
+            video_response.raise_for_status()
 
             output_path = Path(output_path)
-            output_path.parent.mkdir(
-                parents=True,
-                exist_ok=True
-            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            total_bytes = 0
 
             with output_path.open("wb") as file:
-                for chunk in video.iter_content(
-                    chunk_size=1024 * 1024
-                ):
+                for chunk in video_response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         file.write(chunk)
+                        total_bytes += len(chunk)
 
-            video.close()
-
-            if output_path.stat().st_size < 10000:
+            if total_bytes < 10000:
+                print("Downloaded file is too small; trying another result.")
                 output_path.unlink(missing_ok=True)
                 continue
 
-            print(f"Downloaded footage for: {query}")
+            # Confirm that FFmpeg can recognize the downloaded video.
+            check = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(output_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            if check.returncode != 0 or not check.stdout.strip():
+                print("Downloaded file is not a valid video; trying another result.")
+                output_path.unlink(missing_ok=True)
+                continue
+
+            print(f"Downloaded real Videvo footage: {output_path}")
             return True
 
         except Exception as error:
-            print("Download candidate failed:", error)
+            print("This Videvo result could not be downloaded:", error)
             Path(output_path).unlink(missing_ok=True)
 
-    return False
+    raise RuntimeError(
+        f"No usable downloadable Videvo footage was found for: {query}. "
+        "Check the GitHub Actions diagnostic logs."
+    )
+
+
+def get_font(size):
+    """
+    Load a font available in the GitHub Actions environment.
+    """
+    possible_fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+
+    for font_path in possible_fonts:
+        if Path(font_path).exists():
+            return ImageFont.truetype(font_path, size)
+
+    return ImageFont.load_default()
 
 
 def make_title_card(text, path, width, height):
-    """Create a separate designed thumbnail, not a video background."""
-    image = Image.new(
-        "RGB",
-        (width, height),
-        (13, 22, 42)
-    )
-
+    """
+    Create a simple thumbnail background if a video frame
+    cannot be extracted.
+    """
+    image = Image.new("RGB", (width, height), (13, 22, 42))
     draw = ImageDraw.Draw(image)
-    font = get_font(max(35, width // 17))
 
-    words = textwrap.wrap(str(text)[:100], width=24)
+    font = get_font(max(30, width // 18))
 
-    y = height // 2 - (len(words) * width // 25)
+    words = str(text).split()
+    lines = []
+    current = ""
 
-    for line in words[:4]:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_width = bbox[2] - bbox[0]
+    for word in words:
+        test = (current + " " + word).strip()
 
-        x = (width - text_width) // 2
+        if draw.textbbox((0, 0), test, font=font)[2] < width * 0.82:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
 
-        draw.text(
-            (x + 3, y + 3),
-            line,
-            fill=(0, 0, 0),
-            font=font
-        )
+    if current:
+        lines.append(current)
 
-        draw.text(
-            (x, y),
-            line,
-            fill=(255, 255, 255),
-            font=font
-        )
+    line_height = max(40, height // 12)
+    total_height = len(lines) * line_height
+    y = (height - total_height) // 2
 
-        y += width // 12
+    for line in lines:
+        box = draw.textbbox((0, 0), line, font=font)
+        x = (width - (box[2] - box[0])) // 2
+        draw.text((x, y), line, fill="white", font=font)
+        y += line_height
 
     image.save(path, quality=95)
 
 
-def create_thumbnail(text, output_path, width=1280, height=720):
+def create_thumbnail(text, output_path, video_source=None,
+                     width=1280, height=720):
     """
-    Use a real video frame as thumbnail background
-    and independently design the thumbnail text.
+    Create a separate thumbnail using a real video frame
+    whenever a source clip is available.
     """
     output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    root = output_path.parent.parent
-    background = root / "work" / "thumbnail_background.jpg"
+    if video_source and Path(video_source).exists():
+        try:
+            run([
+                "ffmpeg",
+                "-y",
+                "-ss", "1",
+                "-i", str(video_source),
+                "-frames:v", "1",
+                "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}",
+                str(output_path),
+            ])
 
-    if background.exists():
-        image = Image.open(background).convert("RGB")
+            if output_path.exists() and output_path.stat().st_size > 1000:
+                print("Thumbnail created from real video footage.")
+                return
 
-        image_ratio = image.width / image.height
-        target_ratio = width / height
+        except Exception as error:
+            print("Could not extract thumbnail frame:", error)
 
-        if image_ratio > target_ratio:
-            new_width = int(image.height * target_ratio)
-            left = (image.width - new_width) // 2
-            image = image.crop((
-                left, 0, left + new_width, image.height
-            ))
-        else:
-            new_height = int(image.width / target_ratio)
-            top = (image.height - new_height) // 2
-            image = image.crop((
-                0, top, image.width, top + new_height
-            ))
-
-        image = image.resize((width, height))
-
-    else:
-        image = Image.new(
-            "RGB",
-            (width, height),
-            (13, 22, 42)
-        )
-
-    draw = ImageDraw.Draw(image)
-    font = get_font(65)
-
-    draw.rectangle(
-        (0, height - 230, width, height),
-        fill=(0, 0, 0, 180)
-    )
-
-    lines = textwrap.wrap(str(text)[:90], width=27)
-
-    y = height - 190
-
-    for line in lines[:3]:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_width = bbox[2] - bbox[0]
-        x = (width - text_width) // 2
-
-        draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=(255, 255, 255)
-        )
-
-        y += 75
-
-    image.save(output_path, quality=95)
-    print("Separate thumbnail created:", output_path)
+    make_title_card(text, output_path, width, height)
 
 
-def create_video(
-    scenes,
-    narration,
-    voice_path,
-    out_path,
-    work_dir,
-    video_format,
-    seconds
-):
+def create_video(scenes, narration, voice_path, out_path,
+                 work_dir, video_format, seconds):
+    """
+    Create a video using a different real Videvo clip for each scene.
+    """
+    work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    width, height = (
-        (1080, 1920)
-        if video_format == "short"
-        else (1920, 1080)
-    )
+    voice_path = Path(voice_path)
 
-    # One visual segment for approximately every 3 seconds.
-    segment_count = math.ceil(seconds / IMAGE_INTERVAL)
+    if not voice_path.exists():
+        raise RuntimeError(f"Voice file not found: {voice_path}")
 
     if not scenes:
-        raise RuntimeError("No AI scenes were supplied.")
+        raise RuntimeError("AI did not provide any video scenes.")
 
-    print(
-        f"Creating {segment_count} visual segments "
-        f"at approximately {IMAGE_INTERVAL}-second intervals."
-    )
+    if video_format == "short":
+        width, height = 1080, 1920
+    else:
+        width, height = 1920, 1080
 
+    scene_duration = 3.0
     segments = []
+    downloaded_sources = []
 
-    thumbnail_saved = False
+    # Make enough segments to cover the requested duration.
+    segment_count = math.ceil(seconds / scene_duration)
 
     for i in range(segment_count):
         scene = scenes[i % len(scenes)]
 
-        query = scene.get("visual_query", "").strip()
-
-        if not query:
-            query = "science technology nature documentary"
-
-        duration = min(
-            IMAGE_INTERVAL,
-            seconds - (i * IMAGE_INTERVAL)
-        )
+        query = scene.get("visual_query") or scene.get("caption") or "science technology"
 
         source = work_dir / f"videvo_{i}.mp4"
         segment = work_dir / f"segment_{i}.mp4"
 
-        print(
-            f"Fetching visual {i + 1}/{segment_count}: {query}"
-        )
+        print(f"Creating scene {i + 1}/{segment_count}")
+        print("Visual search query:", query)
 
-        success = False
+        fetch_videvo_clip(query, source)
+        downloaded_sources.append(source)
 
-        # Try several pages before declaring footage unavailable.
-        for page in range(1, 4):
-            try:
-                success = fetch_videvo_clip(
-                    query,
-                    source,
-                    page=page
-                )
+        duration = min(scene_duration, seconds - i * scene_duration)
 
-                if success:
-                    break
-
-            except Exception as error:
-                print(
-                    f"Videvo page {page} failed: {error}"
-                )
-
-        if not success:
-            raise RuntimeError(
-                f"No real Videvo footage could be downloaded "
-                f"for scene {i + 1}: {query}. "
-                f"Stopping instead of creating a blue background."
-            )
-
-        # Extract a real video frame for a separate thumbnail.
-        if not thumbnail_saved:
-            thumbnail_frame = (
-                work_dir / "thumbnail_background.jpg"
-            )
-
-            try:
-                run([
-                    "ffmpeg", "-y",
-                    "-ss", "1",
-                    "-i", str(source),
-                    "-frames:v", "1",
-                    "-q:v", "2",
-                    str(thumbnail_frame)
-                ])
-
-                thumbnail_saved = thumbnail_frame.exists()
-
-            except Exception as error:
-                print("Thumbnail frame extraction failed:", error)
-
-        # Convert each downloaded clip into a 3-second segment.
         run([
-            "ffmpeg", "-y",
+            "ffmpeg",
+            "-y",
             "-stream_loop", "-1",
             "-i", str(source),
             "-t", str(duration),
             "-vf",
             (
-                f"scale={width}:{height}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},"
-                f"fps={VIDEO_FPS},"
-                "setsar=1"
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},fps=30,format=yuv420p"
             ),
             "-an",
             "-c:v", "libx264",
             "-preset", "veryfast",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(segment)
+            "-crf", "23",
+            str(segment),
         ])
 
         segments.append(segment)
 
-        print(
-            f"Visual segment {i + 1}/{segment_count} completed."
-        )
+    if not segments:
+        raise RuntimeError("No video segments were created.")
 
-    # Combine all video segments.
     concat_file = work_dir / "concat.txt"
 
     concat_file.write_text(
-        "".join(
-            f"file '{p.resolve()}'\n"
-            for p in segments
-        ),
-        encoding="utf-8"
+        "".join(f"file '{segment.resolve()}'\n" for segment in segments),
+        encoding="utf-8",
     )
 
-    silent_video = work_dir / "silent.mp4"
+    silent_video = work_dir / "silent_video.mp4"
 
     run([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
-        str(silent_video)
+        str(silent_video),
     ])
 
-    # Add the generated voice narration.
     run([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", str(silent_video),
         "-i", str(voice_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-shortest",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-c:v", "copy",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-shortest",
         "-movflags", "+faststart",
-        str(out_path)
+        str(out_path),
     ])
 
-    print("Video created successfully:", out_path)
+    print("Video successfully created:", out_path)
+
+    return downloaded_sources[0]
