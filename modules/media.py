@@ -1,318 +1,251 @@
 import os
+import re
+import math
+import time
 import random
 import subprocess
 import requests
-import math
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
 
-VIDEVO_API_URL = "https://api.videvo.net/v1/search"
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+UNSPLASH_API = "https://api.unsplash.com"
+APP_NAME = "ai_youtube_facts_automation"
 
 
 def run(cmd):
     subprocess.run(cmd, check=True)
 
 
-def extract_results(data):
-    """
-    Find video results in common Videvo API response formats.
-    """
-    if isinstance(data, list):
-        return data
+def get_headers():
+    key = os.getenv("UNSPLASH_ACCESS_KEY")
 
-    if not isinstance(data, dict):
-        return []
+    if not key:
+        raise RuntimeError(
+            "UNSPLASH_ACCESS_KEY is missing from GitHub Secrets."
+        )
 
-    for key in ("results", "data", "clips", "videos", "items"):
-        value = data.get(key)
-
-        if isinstance(value, list):
-            return value
-
-        if isinstance(value, dict):
-            for nested_key in ("results", "clips", "videos", "items"):
-                nested = value.get(nested_key)
-                if isinstance(nested, list):
-                    return nested
-
-    return []
+    return {
+        "Authorization": f"Client-ID {key}",
+        "Accept-Version": "v1"
+    }
 
 
-def find_download_url(clip):
-    """
-    Extract a possible video download URL from a result.
-    """
-    if not isinstance(clip, dict):
-        return None
+def search_unsplash(query, orientation="landscape"):
+    headers = get_headers()
 
-    direct_fields = (
-        "download_url",
-        "downloadUrl",
-        "url_hd",
-        "url_sd",
-        "video_url",
-        "preview_url",
+    print("Searching Unsplash for:", query)
+
+    for attempt in range(4):
+        try:
+            response = requests.get(
+                f"{UNSPLASH_API}/search/photos",
+                headers=headers,
+                params={
+                    "query": query,
+                    "page": 1,
+                    "per_page": 10,
+                    "orientation": orientation,
+                    "content_filter": "high"
+                },
+                timeout=40
+            )
+
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "Unsplash rate limit reached. Try again later."
+                )
+
+            response.raise_for_status()
+
+            results = response.json().get("results", [])
+
+            if not results:
+                raise RuntimeError(
+                    f"No Unsplash photographs found for: {query}"
+                )
+
+            return results
+
+        except requests.RequestException as error:
+            if attempt == 3:
+                raise RuntimeError(
+                    f"Unsplash search failed: {error}"
+                ) from error
+
+            delay = 3 * (attempt + 1)
+            print(f"Search retry in {delay} seconds.")
+            time.sleep(delay)
+
+    raise RuntimeError("Unsplash search failed.")
+
+
+def track_download(photo):
+    download_url = (
+        photo.get("links", {}).get("download_location")
     )
 
-    for field in direct_fields:
-        value = clip.get(field)
+    if not download_url:
+        raise RuntimeError(
+            "Unsplash did not provide a download tracking URL."
+        )
 
-        if isinstance(value, str) and value.startswith("http"):
-            return value
+    response = requests.get(
+        download_url,
+        headers=get_headers(),
+        params={
+            "utm_source": APP_NAME,
+            "utm_medium": "referral"
+        },
+        timeout=30
+    )
 
-    # Some APIs put download links inside nested objects.
-    for field in ("download", "files", "video_files", "video"):
-        value = clip.get(field)
+    response.raise_for_status()
 
-        if isinstance(value, str) and value.startswith("http"):
-            return value
 
-        if isinstance(value, dict):
-            for nested_value in value.values():
-                if isinstance(nested_value, str) and nested_value.startswith("http"):
-                    return nested_value
+def get_photo(query, orientation, used_ids):
+    results = search_unsplash(query, orientation)
 
-                if isinstance(nested_value, dict):
-                    for item in nested_value.values():
-                        if isinstance(item, str) and item.startswith("http"):
-                            return item
+    available = [
+        photo for photo in results
+        if photo.get("id") not in used_ids
+        and photo.get("urls", {}).get("regular")
+    ]
 
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and item.startswith("http"):
-                    return item
+    if not available:
+        available = [
+            photo for photo in results
+            if photo.get("urls", {}).get("regular")
+        ]
 
-                if isinstance(item, dict):
-                    for nested_value in item.values():
-                        if isinstance(nested_value, str) and nested_value.startswith("http"):
-                            return nested_value
+    if not available:
+        raise RuntimeError(
+            f"No usable Unsplash photo for: {query}"
+        )
+
+    photo = random.choice(available)
+
+    # Required Unsplash download event.
+    track_download(photo)
+
+    image_url = photo["urls"]["regular"]
+
+    username = photo.get("user", {}).get(
+        "username", "unknown"
+    )
+
+    name = photo.get("user", {}).get(
+        "name", "Unknown photographer"
+    )
+
+    profile = (
+        f"https://unsplash.com/@{username}"
+        f"?utm_source={APP_NAME}&utm_medium=referral"
+    )
+
+    photo_link = photo.get("links", {}).get("html", "")
+
+    used_ids.add(photo.get("id"))
+
+    return {
+        "url": image_url,
+        "id": photo.get("id"),
+        "name": name,
+        "profile": profile,
+        "photo_link": photo_link
+    }
+
+
+def get_font_path():
+    fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+    ]
+
+    for font in fonts:
+        if Path(font).exists():
+            return font
 
     return None
 
 
-def fetch_videvo_clip(query, output_path):
-    """
-    Search Videvo and download one real video clip.
-    """
-    api_key = os.getenv("VIDEVO_API_KEY")
-
-    if not api_key:
-        raise RuntimeError("VIDEVO_API_KEY is missing from GitHub Secrets.")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    params = {
-        "query": query,
-        "page": 1,
-        "per_page": 20,
-        "license_type": "free",
-    }
-
-    print(f"Searching Videvo for: {query}")
-
-    response = requests.get(
-        VIDEVO_API_URL,
-        headers=headers,
-        params=params,
-        timeout=40,
-    )
-
-    print("Videvo search HTTP status:", response.status_code)
-
-    if response.status_code == 401:
-        raise RuntimeError("Videvo rejected the API key (HTTP 401).")
-
-    if response.status_code == 403:
-        raise RuntimeError("Videvo denied API access (HTTP 403).")
-
-    if response.status_code == 429:
-        raise RuntimeError("Videvo rate limit reached (HTTP 429).")
-
-    response.raise_for_status()
-
-    try:
-        data = response.json()
-    except ValueError:
-        raise RuntimeError("Videvo did not return valid JSON.")
-
-    if isinstance(data, dict):
-        print("Videvo response keys:", list(data.keys()))
-
-    results = extract_results(data)
-
-    if not results:
-        raise RuntimeError(
-            "Videvo returned no recognizable video results. "
-            "Check the API response format and API access."
-        )
-
-    random.shuffle(results)
-
-    for clip in results:
-        if not isinstance(clip, dict):
-            continue
-
-        print("Available clip fields:", list(clip.keys()))
-
-        video_url = find_download_url(clip)
-
-        if not video_url:
-            continue
-
-        try:
-            video_response = requests.get(
-                video_url,
-                timeout=90,
-                stream=True,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-
-            print("Video download HTTP status:", video_response.status_code)
-
-            video_response.raise_for_status()
-
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            total_bytes = 0
-
-            with output_path.open("wb") as file:
-                for chunk in video_response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        file.write(chunk)
-                        total_bytes += len(chunk)
-
-            if total_bytes < 10000:
-                print("Downloaded file is too small; trying another result.")
-                output_path.unlink(missing_ok=True)
-                continue
-
-            # Confirm that FFmpeg can recognize the downloaded video.
-            check = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(output_path),
-                ],
-                capture_output=True,
-                text=True,
-            )
-
-            if check.returncode != 0 or not check.stdout.strip():
-                print("Downloaded file is not a valid video; trying another result.")
-                output_path.unlink(missing_ok=True)
-                continue
-
-            print(f"Downloaded real Videvo footage: {output_path}")
-            return True
-
-        except Exception as error:
-            print("This Videvo result could not be downloaded:", error)
-            Path(output_path).unlink(missing_ok=True)
-
-    raise RuntimeError(
-        f"No usable downloadable Videvo footage was found for: {query}. "
-        "Check the GitHub Actions diagnostic logs."
-    )
-
-
-def get_font(size):
-    """
-    Load a font available in the GitHub Actions environment.
-    """
-    possible_fonts = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    ]
-
-    for font_path in possible_fonts:
-        if Path(font_path).exists():
-            return ImageFont.truetype(font_path, size)
-
-    return ImageFont.load_default()
-
-
-def make_title_card(text, path, width, height):
-    """
-    Create a simple thumbnail background if a video frame
-    cannot be extracted.
-    """
-    image = Image.new("RGB", (width, height), (13, 22, 42))
-    draw = ImageDraw.Draw(image)
-
-    font = get_font(max(30, width // 18))
-
-    words = str(text).split()
-    lines = []
-    current = ""
-
-    for word in words:
-        test = (current + " " + word).strip()
-
-        if draw.textbbox((0, 0), test, font=font)[2] < width * 0.82:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    line_height = max(40, height // 12)
-    total_height = len(lines) * line_height
-    y = (height - total_height) // 2
-
-    for line in lines:
-        box = draw.textbbox((0, 0), line, font=font)
-        x = (width - (box[2] - box[0])) // 2
-        draw.text((x, y), line, fill="white", font=font)
-        y += line_height
-
-    image.save(path, quality=95)
-
-
-def create_thumbnail(text, output_path, video_source=None,
-                     width=1280, height=720):
-    """
-    Create a separate thumbnail using a real video frame
-    whenever a source clip is available.
-    """
+def create_thumbnail(
+    text,
+    output_path,
+    video_source=None,
+    width=1280,
+    height=720
+):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if video_source and Path(video_source).exists():
-        try:
-            run([
-                "ffmpeg",
-                "-y",
-                "-ss", "1",
-                "-i", str(video_source),
-                "-frames:v", "1",
-                "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}",
-                str(output_path),
-            ])
+    if not video_source:
+        raise RuntimeError(
+            "A real Unsplash image is required for the thumbnail."
+        )
 
-            if output_path.exists() and output_path.stat().st_size > 1000:
-                print("Thumbnail created from real video footage.")
-                return
+    image_url = str(video_source)
 
-        except Exception as error:
-            print("Could not extract thumbnail frame:", error)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loop", "1",
+        "-i", image_url,
+        "-frames:v", "1",
+        "-vf",
+        (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    ]
 
-    make_title_card(text, output_path, width, height)
+    font = get_font_path()
+
+    if font:
+        text_file = output_path.parent / "thumbnail_text.txt"
+        text_file.write_text(
+            str(text)[:65].replace("\n", " "),
+            encoding="utf-8"
+        )
+
+        command.extend([
+            "-vf",
+            (
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                f"drawtext=fontfile='{font}':"
+                f"textfile='{text_file}':"
+                "fontcolor=white:fontsize=65:"
+                "x=(w-text_w)/2:y=h*0.76:"
+                "box=1:boxcolor=black@0.55:boxborderw=18"
+            )
+        ])
+
+    command.extend([
+        "-q:v", "2",
+        str(output_path)
+    ])
+
+    run(command)
+
+    if not output_path.exists() or output_path.stat().st_size < 1000:
+        raise RuntimeError("Thumbnail creation failed.")
+
+    print("Real Unsplash thumbnail created.")
 
 
-def create_video(scenes, narration, voice_path, out_path,
-                 work_dir, video_format, seconds):
-    """
-    Create a video using a different real Videvo clip for each scene.
-    """
+def create_video(
+    scenes,
+    narration,
+    voice_path,
+    out_path,
+    work_dir,
+    video_format,
+    seconds
+):
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -322,67 +255,121 @@ def create_video(scenes, narration, voice_path, out_path,
     voice_path = Path(voice_path)
 
     if not voice_path.exists():
-        raise RuntimeError(f"Voice file not found: {voice_path}")
+        raise RuntimeError(
+            f"Voice file not found: {voice_path}"
+        )
 
     if not scenes:
-        raise RuntimeError("AI did not provide any video scenes.")
+        raise RuntimeError("No scenes were supplied by Gemini.")
 
     if video_format == "short":
         width, height = 1080, 1920
+        orientation = "portrait"
     else:
         width, height = 1920, 1080
+        orientation = "landscape"
 
     scene_duration = 3.0
-    segments = []
-    downloaded_sources = []
-
-    # Make enough segments to cover the requested duration.
     segment_count = math.ceil(seconds / scene_duration)
 
+    segments = []
+    used_ids = set()
+    attribution = []
+    first_image_url = None
+
+    attribution_file = (
+        work_dir / "unsplash_attribution.txt"
+    )
+
     for i in range(segment_count):
+
         scene = scenes[i % len(scenes)]
 
-        query = scene.get("visual_query") or scene.get("caption") or "science technology"
+        query = (
+            scene.get("visual_query")
+            or scene.get("caption")
+            or "science technology"
+        )
 
-        source = work_dir / f"videvo_{i}.mp4"
-        segment = work_dir / f"segment_{i}.mp4"
-
-        print(f"Creating scene {i + 1}/{segment_count}")
+        print(
+            f"Creating scene {i + 1}/{segment_count}"
+        )
         print("Visual search query:", query)
 
-        fetch_videvo_clip(query, source)
-        downloaded_sources.append(source)
+        photo = get_photo(
+            query,
+            orientation,
+            used_ids
+        )
 
-        duration = min(scene_duration, seconds - i * scene_duration)
+        image_url = photo["url"]
+
+        if first_image_url is None:
+            first_image_url = image_url
+
+        attribution.append(
+            f"Photo by {photo['name']}\n"
+            f"Photographer profile: {photo['profile']}\n"
+            f"Photo: {photo['photo_link']}\n"
+            f"Source: Unsplash\n"
+        )
+
+        duration = min(
+            scene_duration,
+            seconds - i * scene_duration
+        )
+
+        frames = max(1, round(duration * 30))
+
+        segment = work_dir / f"segment_{i}.mp4"
+
+        print("Creating moving photograph.")
+
+        zoom_filter = (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"zoompan=z='min(zoom+0.0008,1.08)':"
+            f"d=1:s={width}x{height}:fps=30,"
+            "format=yuv420p"
+        )
 
         run([
             "ffmpeg",
             "-y",
-            "-stream_loop", "-1",
-            "-i", str(source),
+            "-loop", "1",
+            "-i", image_url,
             "-t", str(duration),
-            "-vf",
-            (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},fps=30,format=yuv420p"
-            ),
+            "-vf", zoom_filter,
+            "-r", "30",
             "-an",
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "23",
-            str(segment),
+            "-pix_fmt", "yuv420p",
+            str(segment)
         ])
+
+        if not segment.exists() or segment.stat().st_size < 1000:
+            raise RuntimeError(
+                f"Video segment {i + 1} was not created."
+            )
 
         segments.append(segment)
 
-    if not segments:
-        raise RuntimeError("No video segments were created.")
+    attribution_file.write_text(
+        "\n".join(attribution),
+        encoding="utf-8"
+    )
 
     concat_file = work_dir / "concat.txt"
 
     concat_file.write_text(
-        "".join(f"file '{segment.resolve()}'\n" for segment in segments),
-        encoding="utf-8",
+        "".join(
+            f"file '{segment.resolve()}'\n"
+            for segment in segments
+        ),
+        encoding="utf-8"
     )
 
     silent_video = work_dir / "silent_video.mp4"
@@ -396,7 +383,7 @@ def create_video(scenes, narration, voice_path, out_path,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
-        str(silent_video),
+        str(silent_video)
     ])
 
     run([
@@ -410,9 +397,13 @@ def create_video(scenes, narration, voice_path, out_path,
         "-c:a", "aac",
         "-shortest",
         "-movflags", "+faststart",
-        str(out_path),
+        str(out_path)
     ])
 
-    print("Video successfully created:", out_path)
+    if not out_path.exists() or out_path.stat().st_size < 10000:
+        raise RuntimeError("Final video was not created correctly.")
 
-    return downloaded_sources[0]
+    print("Unsplash video successfully created:", out_path)
+    print("Attribution file:", attribution_file)
+
+    return first_image_url
