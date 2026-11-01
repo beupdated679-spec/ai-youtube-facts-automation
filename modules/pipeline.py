@@ -38,11 +38,23 @@ def run_pipeline(config, root: Path):
 
     seconds = int(config["short_seconds"] if fmt == "short" else config["long_seconds"])
     video_path = output / f"daily_{fmt}.mp4"
-    create_video(data["scenes"], data["narration"], voice_path, video_path,
-                 work, fmt, seconds)
+    first_video_source = create_video(
+    data["scenes"],
+    data["narration"],
+    voice_path,
+    video_path,
+    work,
+    fmt,
+    seconds
+)
 
-    thumb_path = output / "thumbnail.jpg"
-    create_thumbnail(data.get("thumbnail_text") or data["title"], thumb_path)
+thumb_path = output / "thumbnail.jpg"
+
+create_thumbnail(
+    data.get("thumbnail_text") or data["title"],
+    thumb_path,
+    first_video_source
+)
 
     result = upload_video(video_path, data, thumb_path, config)
     report = {
