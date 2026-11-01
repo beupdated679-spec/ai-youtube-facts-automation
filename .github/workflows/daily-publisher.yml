@@ -2,7 +2,7 @@ name: AI YouTube Daily Publisher
 
 on:
   schedule:
-    - cron: "0 17 * * *"
+    - cron: "0 14 * * *"
   workflow_dispatch:
 
 permissions:
