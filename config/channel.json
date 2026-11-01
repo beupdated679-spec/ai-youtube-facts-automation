@@ -22,7 +22,7 @@
   "category_id": "27",
   "default_language": "en-US",
   "tts_voice": "en-US-AriaNeural",
-  "gemini_model": "gemini-3.8-flash",
+  "gemini_model": "gemini-2.5-flash",
   "video_title_suffix": "",
   "max_tags": 15
 }
