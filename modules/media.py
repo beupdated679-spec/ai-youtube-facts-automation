@@ -9,6 +9,8 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse
 
+from PIL import Image, ImageDraw, ImageFont
+
 
 UNSPLASH_API = "https://api.unsplash.com"
 APP_NAME = "ai_youtube_facts_automation"
@@ -125,9 +127,7 @@ def track_download(photo):
     )
 
     if not download_url:
-        raise RuntimeError(
-            "Unsplash did not provide a download tracking URL."
-        )
+        return
 
     response = requests.get(
         download_url,
@@ -139,60 +139,139 @@ def track_download(photo):
         timeout=30
     )
 
+    if response.status_code in (401, 403, 429):
+        raise RuntimeError(
+            f"Unsplash download tracking denied (HTTP {response.status_code})."
+        )
+
     response.raise_for_status()
 
 
-def get_photo(query, orientation, used_ids):
-    results = search_unsplash(query, orientation)
+def build_fallback_image(query, output_path, width=1920, height=1080):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    available = [
-        photo for photo in results
-        if photo.get("id") not in used_ids
-        and photo.get("urls", {}).get("regular")
-    ]
+    image = Image.new("RGB", (width, height), color=(18, 29, 47))
+    draw = ImageDraw.Draw(image)
 
-    if not available:
+    for y in range(0, height, 4):
+        alpha = y / max(1, height)
+        color = (
+            int(20 + 90 * alpha),
+            int(35 + 110 * alpha),
+            int(55 + 140 * alpha),
+        )
+        draw.line((0, y, width, y), fill=color, width=4)
+
+    title = (query or "History & Science").strip()
+    title = re.sub(r"\s+", " ", title)
+    if len(title) > 72:
+        title = title[:69].rstrip() + "..."
+
+    font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        size=max(36, int(width / 18)),
+    )
+    lines = []
+    current = ""
+    for word in title.split():
+        candidate = f"{current} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=font)[2] < width * 0.78:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    if not lines:
+        lines = [title]
+
+    text_y = (height - (len(lines) * (font.size + 18))) // 2
+    for line in lines[:3]:
+        box = draw.textbbox((0, 0), line, font=font)
+        x = (width - (box[2] - box[0])) / 2
+        y = text_y
+        draw.text((x + 3, y + 3), line, font=font, fill=(0, 0, 0))
+        draw.text((x, y), line, font=font, fill=(255, 255, 255))
+        text_y += font.size + 18
+
+    image.save(output_path, quality=92)
+    return str(output_path)
+
+
+def get_photo(query, orientation, used_ids, fallback_dir=None):
+    fallback_dir = Path(fallback_dir or "./work")
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        results = search_unsplash(query, orientation)
+
         available = [
             photo for photo in results
-            if photo.get("urls", {}).get("regular")
+            if photo.get("id") not in used_ids
+            and photo.get("urls", {}).get("regular")
         ]
 
-    if not available:
-        raise RuntimeError(
-            f"No usable Unsplash photo for: {query}"
+        if not available:
+            available = [
+                photo for photo in results
+                if photo.get("urls", {}).get("regular")
+            ]
+
+        if not available:
+            raise RuntimeError(
+                f"No usable Unsplash photo for: {query}"
+            )
+
+        photo = random.choice(available)
+
+        track_download(photo)
+
+        image_url = photo["urls"]["regular"]
+
+        username = photo.get("user", {}).get(
+            "username", "unknown"
         )
 
-    photo = random.choice(available)
+        name = photo.get("user", {}).get(
+            "name", "Unknown photographer"
+        )
 
-    # Required Unsplash download event.
-    track_download(photo)
+        profile = (
+            f"https://unsplash.com/@{username}"
+            f"?utm_source={APP_NAME}&utm_medium=referral"
+        )
 
-    image_url = photo["urls"]["regular"]
+        photo_link = photo.get("links", {}).get("html", "")
 
-    username = photo.get("user", {}).get(
-        "username", "unknown"
-    )
+        used_ids.add(photo.get("id"))
 
-    name = photo.get("user", {}).get(
-        "name", "Unknown photographer"
-    )
+        return {
+            "url": image_url,
+            "id": photo.get("id"),
+            "name": name,
+            "profile": profile,
+            "photo_link": photo_link
+        }
+    except Exception as exc:
+        print(
+            f"Unsplash media unavailable for '{query}': {exc}. "
+            "Falling back to a generated title card."
+        )
 
-    profile = (
-        f"https://unsplash.com/@{username}"
-        f"?utm_source={APP_NAME}&utm_medium=referral"
-    )
+        fallback_path = fallback_dir / f"fallback_{abs(hash(query))}_{len(used_ids)}.jpg"
+        generated = build_fallback_image(query, fallback_path)
+        used_ids.add(f"fallback-{generated}")
 
-    photo_link = photo.get("links", {}).get("html", "")
-
-    used_ids.add(photo.get("id"))
-
-    return {
-        "url": image_url,
-        "id": photo.get("id"),
-        "name": name,
-        "profile": profile,
-        "photo_link": photo_link
-    }
+        return {
+            "url": generated,
+            "id": f"fallback-{generated}",
+            "name": "Generated card",
+            "profile": "",
+            "photo_link": ""
+        }
 
 
 def get_font_path():
@@ -337,7 +416,8 @@ def create_video(
         photo = get_photo(
             query,
             orientation,
-            used_ids
+            used_ids,
+            fallback_dir=work_dir
         )
 
         image_url = photo["url"]
